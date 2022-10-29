@@ -1,0 +1,143 @@
+library(reshape2)
+library(Seurat)
+library(monocle)
+library(tidyverse)
+library(patchwork)
+library(SCENIC)
+library(AUCell)
+library(topGO)
+library(DOSE)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+dat <- CreateSeuratObject(counts = data, project = "CRC", min.cells = 3, min.features = 200)
+dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
+dat <- subset(dat, subset = nFeature_RNA > 200 & nFeature_RNA < 6000& percent.mt < 20 & nCount_RNA>500)
+countdata <- NormalizeData(dat, normalization.method = "LogNormalize", scale.factor = 10000)
+countdata <- FindVariableFeatures(countdata, selection.method = "vst", nfeatures = 2000)
+all.genes <- rownames(countdata)
+pcadat <- ScaleData(countdata, features = all.genes)
+pcadat <- RunPCA(pcadat, features = VariableFeatures(object = pcadat))
+pcadat.list <- SplitObject(pcadat, split.by = "orign")
+for (i in 1:length(pcadat.list)) {
+  pcadat.list[[i]] <- NormalizeData(pcadat.list[[i]], verbose = FALSE)
+  pcadat.list[[i]] <- FindVariableFeatures(pcadat.list[[i]], selection.method = "vst", nfeatures = 2000, 
+                                           verbose = FALSE)
+}
+reference.list <- pcadat.list[c("T1", "T2",'T3')]
+pcadat.anchors <- FindIntegrationAnchors(object.list = reference.list,anchor.features = 2000 ,dims = 1:30)
+pcadat.integrated <- IntegrateData(anchorset = pcadat.anchors, dims = 1:30)
+pcadat.integrated <- ScaleData(pcadat.integrated, verbose = FALSE)
+pcadat.integrated <- RunPCA(pcadat.integrated, npcs = 30, verbose = FALSE)
+tsnedata <- FindNeighbors(pcadat.integrated, dims = 1:50)
+tsnedata <- FindClusters(tsnedata, resolution = 0.2)
+tsnedata<-CalculateBarcodeInflections(tsnedata)
+SubsetByBarcodeInflections(tsnedata)
+tsnedata <- RunUMAP(tsnedata, dims = 1:30)
+DefaultAssay(tsnedata) <- "RNA"
+markers <- FindAllMarkers(tsnedata, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+markers=markers[which(markers[,'p_val_adj']<0.01),]
+
+sample_ann <- as.data.frame(tsnedata@meta.data) 
+gene_ann <- data.frame(
+  gene_short_name = row.names(tsnedata), 
+  row.names = row.names(tsnedata)
+)
+monodat <- tsnedata@assays[["RNA"]]@counts
+pd <- new("AnnotatedDataFrame", data=sample_ann)
+fd <- new("AnnotatedDataFrame", data=gene_ann)
+
+sc_cds <- newCellDataSet(
+  monodat, 
+  phenoData = pd,
+  featureData =fd,
+  expressionFamily = negbinomial.size(),
+  lowerDetectionLimit=1)
+sc_cds <- estimateSizeFactors(sc_cds)
+sc_cds <- estimateDispersions(sc_cds)
+sc_cds <- detectGenes(sc_cds, min_expr = 0.1)
+
+disp_table <- dispersionTable(sc_cds)
+unsup_clustering_genes <- subset(disp_table, 
+                                 mean_expression >= 0.1)
+sc_cds <- setOrderingFilter(sc_cds, unsup_clustering_genes$gene_id)
+diff_test_res <- differentialGeneTest(sc_cds,fullModelFormulaStr = "~seurat_clusters",cores = 6)
+ordering_genes <- row.names (subset(diff_test_res,qval < 0.001))
+sc_cds <- setOrderingFilter(sc_cds, ordering_genes)
+sc_cds <- reduceDimension(sc_cds, max_components = 2,
+                          method = 'DDRTree')
+sc_cds <- orderCells(sc_cds)
+
+
+mydbDIR <- "~/refdat"
+mydbs <- c("hg19-500bp-upstream-7species.mc9nr.feather",
+           "hg19-tss-centered-10kb-7species.mc9nr.feather")
+names(mydbs) <- c("500bp", "10kb")
+scenicOptions <- initializeScenic(org="hgnc", 
+                                  nCores=8,
+                                  dbDir=mydbDIR, 
+                                  dbs = mydbs,
+                                  datasetTitle = "CRC")
+cellInfo <- data.frame(tsnedata@meta.data)
+colnames(cellInfo)[which(colnames(cellInfo)=="orig.ident")] <- "sample"
+colnames(cellInfo)[which(colnames(cellInfo)=="seurat_clusters")] <- "cluster"
+colnames(cellInfo)[which(colnames(cellInfo)=="type")] <- "celltype"
+cellInfo <- cellInfo[,c("sample","cluster","celltype")]
+subcell <- sample(colnames(scRNA),1000)
+scRNAsub <- scRNA[,subcell]
+saveRDS(scRNAsub, "scRNAsub.rds")
+exprMat <- as.matrix(scRNAsub@assays$RNA@counts)
+genesKept <- geneFiltering(exprMat, scenicOptions, 
+                           minCountsPerGene = 3 * 0.01 * ncol(exprMat), 
+                           minSamples = ncol(exprMat) * 0.01)
+exprMat_filtered <- exprMat[genesKept, ]
+runCorrelation(exprMat_filtered, scenicOptions)
+exprMat_filtered_log <- log2(exprMat_filtered+1)
+runGenie3(exprMat_filtered_log, scenicOptions, nParts = 20)
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+runSCENIC_2_createRegulons(scenicOptions)
+exprMat_all <- as.matrix(tsnedata@assays$RNA@counts)
+exprMat_all <- log2(exprMat_all+1)
+runSCENIC_3_scoreCells(scenicOptions, exprMat=exprMat_all)
+aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat_all)
+savedSelections <- shiny::runApp(aucellApp)
+newThresholds <- savedSelections$thresholds
+scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
+saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+runSCENIC_4_aucell_binarize(scenicOptions, exprMat=exprMat_all)
+AUCmatrix <- readRDS("int/3.4_regulonAUC.Rds")
+AUCmatrix <- AUCmatrix@assays@data@listData$AUC
+AUCmatrix <- data.frame(t(AUCmatrix), check.names=F)
+RegulonName_AUC <- colnames(AUCmatrix)
+RegulonName_AUC <- gsub(' \\(','_',RegulonName_AUC)
+RegulonName_AUC <- gsub('\\)','',RegulonName_AUC)
+colnames(AUCmatrix) <- RegulonName_AUC
+scRNAauc <- AddMetaData(tsnedata, AUCmatrix)
+scRNAauc@assays$integrated <- NULL
+saveRDS(scRNAauc,'scRNAauc.rds')
+BINmatrix <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+BINmatrix <- data.frame(t(BINmatrix), check.names=F)
+RegulonName_BIN <- colnames(BINmatrix)
+RegulonName_BIN <- gsub(' \\(','_',RegulonName_BIN)
+RegulonName_BIN <- gsub('\\)','',RegulonName_BIN)
+colnames(BINmatrix) <- RegulonName_BIN
+scRNAbin <- AddMetaData(tsnedata, BINmatrix)
+scRNAbin@assays$integrated <- NULL
+saveRDS(scRNAbin, 'scRNAbin.rds')
+
+
+gene.df <- bitr(gene, fromType ="SYMBOL" ,
+                toType = c("ENTREZID" ),
+                OrgDb = org.Hs.eg.db)
+
+ego <- enrichGO(gene = gene.df$ENTREZID,
+                   OrgDb=org.Hs.eg.db,
+                   ont="ALL",
+                   pAdjustMethod = "BH",
+                   minGSSize = 1,
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable = TRUE)
+
+
